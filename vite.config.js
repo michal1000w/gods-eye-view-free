@@ -5452,6 +5452,14 @@ function openAiRealtimeProxy() {
           audio: {
             input: {
               noise_reduction: { type: 'near_field' },
+              // The trace UI shows this transcript to the operator. Make the
+              // separate ASR pass explicit and domain-guided instead of
+              // accepting a provider default that can hallucinate a noisy tail.
+              transcription: {
+                model: process.env.OPENAI_REALTIME_TRANSCRIBE_MODEL || 'gpt-4o-transcribe',
+                language: process.env.OPENAI_REALTIME_TRANSCRIBE_LANGUAGE || 'en',
+                prompt: 'Short spoken English commands for a geospatial globe application. Transcribe only words actually spoken. Do not add instructions, filler, or guessed text.',
+              },
               turn_detection: {
                 type: 'semantic_vad',
                 eagerness: 'low',

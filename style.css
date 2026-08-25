@@ -8493,6 +8493,99 @@ body:not(.ui-clean-view):not(.recording-mode):has(#intel-hud[data-variant='minim
   box-shadow: 0 0 0.35rem rgba(54, 220, 255, 0.28);
 }
 
+/* ── Voice activity trace ─────────────────────────────────────────────── */
+#gev-voice-trace {
+  position: fixed;
+  top: 50%;
+  right: 0;
+  z-index: 9;
+  width: 2.35rem;
+  max-height: 4.8rem;
+  overflow: hidden;
+  color: rgba(218, 239, 246, 0.92);
+  background: linear-gradient(145deg, rgba(8, 25, 36, 0.9), rgba(6, 17, 27, 0.84));
+  border: 1px solid rgba(102, 199, 222, 0.28);
+  border-radius: 0.42rem 0 0 0.42rem;
+  box-shadow: 0 1rem 2.8rem rgba(0, 0, 0, 0.42), 0 0 1.8rem rgba(0, 212, 255, 0.07) inset;
+  backdrop-filter: blur(22px) saturate(1.2);
+  -webkit-backdrop-filter: blur(22px) saturate(1.2);
+  transform: translateY(-50%);
+  transition: width 180ms ease, max-height 180ms ease, right 180ms ease, transform 180ms ease;
+}
+
+/* A closed trace is a slim edge tab, so it never takes map viewport space.
+   The full readout appears only after the operator explicitly opens it. */
+#gev-voice-trace:not([data-expanded='true']) .gev-voice-trace-header { height: 4.8rem; padding: 0; border: 0; }
+#gev-voice-trace:not([data-expanded='true']) .gev-voice-trace-header > :not(.gev-voice-trace-toggle),
+#gev-voice-trace:not([data-expanded='true']) :is(.gev-voice-trace-key, .gev-voice-trace-feed) { display: none; }
+#gev-voice-trace[data-expanded='true'] {
+  /* The right rail owns the outer edge. An intentionally opened trace stays
+     beside it instead of covering its interactive Context/CCTV controls. */
+  top: clamp(7.5rem, 15vh, 10.5rem);
+  right: calc(var(--right-rail-x) + 330px + 1rem);
+  width: min(clamp(15.5rem, 20vw, 19rem), calc(100vw - var(--right-rail-x) - 330px - 3rem));
+  max-height: min(56vh, 32rem);
+  border-radius: 0.42rem;
+  transform: none;
+}
+
+#gev-voice-trace * { box-sizing: border-box; }
+
+.gev-voice-trace-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.7rem 0.75rem 0.58rem;
+  border-bottom: 1px solid rgba(113, 209, 234, 0.16);
+}
+
+.gev-voice-trace-header div { display: grid; gap: 0.1rem; }
+.gev-voice-trace-header span,
+.gev-voice-trace-key,
+.gev-voice-trace-label,
+.gev-voice-trace-empty {
+  font-family: var(--font-mono);
+  font-size: 0.48rem;
+  letter-spacing: 0.1rem;
+}
+.gev-voice-trace-header span { color: rgba(168, 215, 227, 0.56); }
+.gev-voice-trace-header strong { color: #80e7ff; font: 600 0.66rem var(--font-mono); letter-spacing: 0.13rem; }
+.gev-voice-trace-header i { width: 0.42rem; height: 0.42rem; border-radius: 50%; background: #49d7f2; box-shadow: 0 0 0.65rem #49d7f2; animation: gev-trace-pulse 2s ease-in-out infinite; }
+.gev-voice-trace-toggle { display: grid; place-items: center; width: 2.35rem; height: 100%; margin-left: 0.3rem; padding: 0; color: #80e7ff; background: transparent; border: 0; font: 1.35rem/1 var(--font-mono); cursor: pointer; }
+#gev-voice-trace[data-expanded='true'] .gev-voice-trace-toggle { width: 1.4rem; height: 1.4rem; margin-left: 0.25rem; border: 1px solid rgba(113, 209, 234, 0.25); border-radius: 0.22rem; font-size: 1rem; transform: rotate(180deg); }
+
+.gev-voice-trace-key { display: flex; gap: 0.62rem; padding: 0.45rem 0.75rem; color: rgba(162, 202, 214, 0.42); border-bottom: 1px solid rgba(113, 209, 234, 0.1); }
+.gev-voice-trace-key span:nth-child(1) { color: #ffbf69; }
+.gev-voice-trace-key span:nth-child(2) { color: #b7d967; }
+.gev-voice-trace-key span:nth-child(3) { color: #76e5ff; }
+
+.gev-voice-trace-feed { max-height: calc(min(56vh, 32rem) - 5rem); overflow: auto; padding: 0.35rem 0.45rem 0.55rem; scrollbar-width: thin; scrollbar-color: rgba(113, 209, 234, 0.35) transparent; }
+.gev-voice-trace-empty { padding: 1.1rem 0.4rem; color: rgba(174, 207, 216, 0.38); text-align: center; }
+.gev-voice-trace-entry { display: grid; grid-template-columns: 0.38rem minmax(0, 1fr); gap: 0.48rem; padding: 0.5rem 0.35rem; border-bottom: 1px solid rgba(113, 209, 234, 0.1); animation: gev-trace-enter 180ms ease-out both; }
+.gev-voice-trace-marker { width: 0.28rem; height: 0.28rem; margin-top: 0.24rem; border-radius: 50%; background: #76e5ff; box-shadow: 0 0 0.5rem rgba(118, 229, 255, 0.48); }
+.gev-voice-trace-entry[data-kind='user'] .gev-voice-trace-marker { background: #ffbf69; box-shadow: 0 0 0.5rem rgba(255, 191, 105, 0.45); }
+.gev-voice-trace-entry[data-kind='tool'] .gev-voice-trace-marker { background: #b7d967; box-shadow: 0 0 0.5rem rgba(183, 217, 103, 0.4); }
+.gev-voice-trace-entry[data-state='working'] .gev-voice-trace-marker { animation: gev-trace-pulse 800ms ease-in-out infinite; }
+.gev-voice-trace-entry[data-state='failed'] .gev-voice-trace-marker { background: #ff7787; box-shadow: 0 0 0.5rem rgba(255, 119, 135, 0.45); }
+.gev-voice-trace-label { display: block; margin-bottom: 0.18rem; color: rgba(184, 216, 225, 0.52); }
+.gev-voice-trace-entry[data-kind='user'] .gev-voice-trace-label { color: #ffbf69; }
+.gev-voice-trace-entry[data-kind='tool'] .gev-voice-trace-label { color: #b7d967; }
+.gev-voice-trace-entry p { margin: 0; color: rgba(230, 244, 248, 0.9); font: 0.68rem/1.42 var(--font-mono); overflow-wrap: anywhere; }
+@keyframes gev-trace-pulse { 50% { opacity: 0.42; transform: scale(0.72); } }
+@keyframes gev-trace-enter { from { opacity: 0; transform: translateX(0.45rem); } to { opacity: 1; transform: translateX(0); } }
+
+body.ui-clean-view #gev-voice-trace,
+body.recording-mode #gev-voice-trace { display: none; }
+@media (max-width: 1180px) {
+  /* Once the map is too narrow for two full side lanes, existing operational
+     panels take priority; the trace stays available whenever that rail is not
+     expanded, without covering its controls. */
+  body:has(#right-context-rail #global-context-panel:not(.collapsed)) #gev-voice-trace[data-expanded='true'],
+  body:has(#right-context-rail #cctv-panel:not(.collapsed)) #gev-voice-trace[data-expanded='true'] { display: none; }
+}
+@media (max-width: 900px) { #gev-voice-trace[data-expanded='true'] { top: 5.5rem; right: 0.75rem; width: min(17rem, calc(100vw - 1.5rem)); max-height: 32vh; } .gev-voice-trace-feed { max-height: calc(32vh - 5rem); } }
+@media (max-width: 620px) { #gev-voice-trace { display: none; } }
+
 /* Center every slide-up tray on the complete unified dock, not its side wing. */
 #command-dock #location-bar .dock-popover-content {
   left: calc((var(--dock-unified-width) - var(--dock-location-open)) / 2);

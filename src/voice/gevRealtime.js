@@ -245,6 +245,7 @@ export class GevRealtimeController {
     this.visualizerOutputAnalyser = null;
     this.visualizerOutputData = null;
     this.visualizerSpeaker = 'idle';
+    this.voiceActivityEntries = new Map();
     this.processedCalls = new Map();
     this.responseActive = false;
     this.responseCreatePending = false;
@@ -575,8 +576,9 @@ export class GevRealtimeController {
         if (!response.ok) throw new Error(data.error || 'Local transcription failed');
         return data;
       });
-      const text = String(transcription.text || '').trim();
+      const text = sanitizeVoiceTranscript(transcription.text);
       if (!text) throw new Error('No speech detected');
+      this.logVoiceActivity('user', text);
       this.setStatus('executing', 'Thinking locally');
       const answer = await fetch('/api/local-ai/chat', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -592,7 +594,16 @@ export class GevRealtimeController {
       for (const call of calls.slice(0, 4)) {
         const fn = call?.function;
         if (!fn?.name) continue;
-        results.push(await this.runner(fn.name, parseArguments(fn.arguments)));
+        const activityId = `local-tool-${call.id || fn.name}-${results.length}`;
+        this.logVoiceActivity('tool', formatVoiceToolName(fn.name), { id: activityId, pending: true });
+        try {
+          const result = await this.runner(fn.name, parseArguments(fn.arguments));
+          results.push(result);
+          this.logVoiceActivity('tool', formatVoiceToolResult(fn.name, result), { id: activityId, ok: result?.ok !== false });
+        } catch (error) {
+          this.logVoiceActivity('tool', `${formatVoiceToolName(fn.name)} — ${error?.message || 'failed'}`, { id: activityId, ok: false });
+          throw error;
+        }
       }
       let reply = String(message.content || '').trim();
       if (results.length) {
@@ -620,6 +631,7 @@ export class GevRealtimeController {
         reply = String(followUp?.choices?.[0]?.message?.content || '').trim() || reply;
       }
       reply = reply || (results.length ? `Completed ${results.map((result) => result?.action || 'command').join(', ')}.` : 'I can answer questions or control the map.');
+      this.logVoiceActivity('model', reply);
       await this.speakLocal(reply);
       this.setStatus('idle', 'LOCAL VOICE STANDBY');
     } catch (error) {
@@ -1212,6 +1224,7 @@ export class GevRealtimeController {
       this.cancelRadioHandoff({ abortTools: true });
       this.setVoiceSpeaker('user');
     }
+    this.recordVoiceActivityFromRealtime(payload);
     this.updateResponseState(payload);
     // The spend cap may have just ended the session from inside the usage
     // accounting above. The connection is already closed, so stop here rather
@@ -1309,6 +1322,8 @@ export class GevRealtimeController {
       let radioOwnershipClaimed = false;
       let radioReservationToken = null;
       let isRadioFeatureCall = call.name === 'control_radio';
+      const activityId = `tool-${call.call_id || call.id || `${call.name}-${performance.now()}`}`;
+      this.logVoiceActivity('tool', formatVoiceToolName(call.name), { id: activityId, pending: true });
       try {
         const parsedArguments = parseArguments(call.arguments);
         const isRadioControlCall = call.name === 'control_radio';
@@ -1467,6 +1482,10 @@ export class GevRealtimeController {
         callId: call.call_id || call.id || null,
         result,
       });
+      this.logVoiceActivity('tool', formatVoiceToolResult(call.name, result), {
+        id: activityId,
+        ok: result?.ok !== false,
+      });
       lastResult = result;
       stopAfterRadioTool = stopAfterRadioTool
         || (
@@ -1606,6 +1625,57 @@ export class GevRealtimeController {
     if (shouldPauseRadioForVoice({ status, pushToTalkKeyHeld: this.pushToTalkKeyHeld })) {
       this.pauseRadioForVoice();
     }
+  }
+
+  /** Record a concise, user-visible trace of the active voice turn. */
+  logVoiceActivity(kind, text, { id = null, pending = false, ok = null } = {}) {
+    const feed = this.ui?.activityFeed;
+    if (!feed || !text) return;
+    const entryId = id || `voice-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    let entry = this.voiceActivityEntries.get(entryId);
+    if (!entry) {
+      feed.querySelector('.gev-voice-trace-empty')?.remove();
+      entry = document.createElement('article');
+      entry.className = 'gev-voice-trace-entry';
+      entry.dataset.kind = kind;
+      entry.innerHTML = '<span class="gev-voice-trace-marker" aria-hidden="true"></span><div><span class="gev-voice-trace-label"></span><p></p></div>';
+      feed.append(entry);
+      this.voiceActivityEntries.set(entryId, entry);
+    }
+    entry.dataset.kind = kind;
+    entry.dataset.state = pending ? 'working' : (ok === false ? 'failed' : 'complete');
+    entry.querySelector('.gev-voice-trace-label').textContent = ({ user: 'YOU SAID', tool: 'TOOL', model: 'MODEL REPLY' })[kind] || 'VOICE';
+    const body = entry.querySelector('p');
+    body.textContent = compactText(String(text), 260);
+    body.title = String(text);
+    while (feed.children.length > 18) {
+      const oldest = feed.firstElementChild;
+      for (const [key, value] of this.voiceActivityEntries) {
+        if (value === oldest) this.voiceActivityEntries.delete(key);
+      }
+      oldest?.remove();
+    }
+    feed.scrollTop = feed.scrollHeight;
+  }
+
+  /** Translate Realtime's transcript events into the side trace. */
+  recordVoiceActivityFromRealtime(payload) {
+    const type = payload?.type || '';
+    if (type === 'conversation.item.input_audio_transcription.completed') {
+      const transcript = sanitizeVoiceTranscript(payload.transcript);
+      if (transcript) this.logVoiceActivity('user', transcript, { id: `user-${payload.item_id || Date.now()}` });
+      return;
+    }
+    const isAssistantTranscript = type === 'response.output_audio_transcript.delta'
+      || type === 'response.output_audio_transcript.done'
+      || type === 'response.output_text.delta'
+      || type === 'response.output_text.done';
+    if (!isAssistantTranscript) return;
+    const id = `model-${payload.response_id || ''}-${payload.item_id || payload.output_index || 'active'}`;
+    const delta = payload.delta ?? payload.transcript ?? payload.text ?? '';
+    if (!delta) return;
+    const existing = this.voiceActivityEntries.get(id)?.querySelector('p')?.textContent || '';
+    this.logVoiceActivity('model', type.endsWith('.delta') ? `${existing}${delta}` : delta, { id });
   }
 
   /**
@@ -2752,6 +2822,31 @@ function createVoiceControl({ reset = false } = {}) {
       root.classList.add('error-dismissed');
     });
   }
+  let trace = document.getElementById('gev-voice-trace');
+  if (!trace) {
+    trace = document.createElement('aside');
+    trace.id = 'gev-voice-trace';
+    trace.setAttribute('aria-label', 'AI voice activity');
+    trace.innerHTML = `
+      <header class="gev-voice-trace-header">
+        <div><span>AI VOICE</span><strong>LIVE TRACE</strong></div>
+        <i aria-label="Live activity indicator"></i>
+        <button class="gev-voice-trace-toggle" type="button" aria-expanded="false" aria-label="Open AI voice activity">‹</button>
+      </header>
+      <div class="gev-voice-trace-key" aria-hidden="true"><span>YOU</span><span>TOOLS</span><span>MODEL</span></div>
+      <div class="gev-voice-trace-feed" role="log" aria-live="polite" aria-relevant="additions text">
+        <div class="gev-voice-trace-empty">VOICE ACTIVITY APPEARS HERE</div>
+      </div>
+    `;
+    document.body.appendChild(trace);
+    trace.querySelector('.gev-voice-trace-toggle')?.addEventListener('click', () => {
+      const expanded = trace.dataset.expanded !== 'true';
+      trace.dataset.expanded = String(expanded);
+      const toggle = trace.querySelector('.gev-voice-trace-toggle');
+      toggle?.setAttribute('aria-expanded', String(expanded));
+      toggle?.setAttribute('aria-label', expanded ? 'Close AI voice activity' : 'Open AI voice activity');
+    });
+  }
   return {
     root,
     button: root.querySelector('#gev-voice-button'),
@@ -2762,5 +2857,32 @@ function createVoiceControl({ reset = false } = {}) {
     errorDetail: root.querySelector('#gev-voice-error-detail'),
     tierButton: root.querySelector('#gev-voice-tier'),
     costValue: root.querySelector('#gev-voice-cost-value'),
+    activityFeed: trace.querySelector('.gev-voice-trace-feed'),
   };
+}
+
+function formatVoiceToolName(name) {
+  return String(name || 'command').replace(/^control_/, '').replace(/^set_/, '').replaceAll('_', ' ');
+}
+
+/**
+ * Voice transcription is shown as an operator record, not an unbounded model
+ * stream. Some speech engines occasionally append a token-like tail after a
+ * completed sentence; keep the first spoken sentence and reject implausibly
+ * long runs so that noise never gets presented as something the operator said.
+ */
+function sanitizeVoiceTranscript(value) {
+  const normalized = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return '';
+  const firstSentence = normalized.match(/^(.{1,180}?[.!?])(?=\s|$|[a-z])/);
+  const concise = (firstSentence?.[1] || normalized).trim();
+  if (/\S{32,}/.test(concise)) return '';
+  return concise.slice(0, 180);
+}
+
+function formatVoiceToolResult(name, result) {
+  const label = formatVoiceToolName(name);
+  if (result?.ok === false) return `${label} — ${result.error || 'could not complete'}`;
+  const detail = result?.message || result?.summary || result?.label || result?.status || result?.action;
+  return detail ? `${label} — ${detail}` : `${label} completed`;
 }
