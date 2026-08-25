@@ -4990,23 +4990,27 @@ function localMlxProxy() {
   // thousands of prompt tokens describing unrelated UI controls on common
   // voice commands.
   const relevantTools = (allTools, messages) => {
-    const request = messages.map((message) => String(message?.content || '')).join(' ').toLowerCase();
+    const rawRequest = messages.map((message) => String(message?.content || '')).join(' ');
+    const request = rawRequest.toLowerCase();
     const asksForInformation = /\?|\b(what|why|how|who|when|where|tell me|explain)\b/.test(request);
     const asksForAction = /\b(turn|switch|show|hide|open|close|fly|go|navigate|zoom|enable|disable|set|select|follow)\b/.test(request);
     if (asksForInformation && !asksForAction) return [];
     const wanted = new Set();
     const add = (...names) => names.forEach((name) => wanted.add(name));
-    if (/\b(fly|go to|navigate|location|city|country|place|coordinate|latitude|longitude)\b/.test(request)) add('fly_to_location');
-    if (/\b(zoom|globe|earth|planet|closer|farther)\b/.test(request)) add('adjust_camera_zoom', 'zoom_to_globe');
+    const containsPlacePhrase = /\b(to|near|around|over|above|at|in)\s+(?:the\s+)?[A-Z][\p{L}\p{N}'-]*/u.test(rawRequest);
+    if (/\b(fly|go to|take me|navigate|location|city|country|place|coordinate|latitude|longitude|near|around|over)\b/.test(request) || containsPlacePhrase) add('fly_to_location');
+    if (/\b(zoom|closer|farther|a bit|a little|slightly)\b/.test(request)) add('adjust_camera_zoom');
+    if (/\b(globe view|whole earth|whole world|the planet|all the way out|full earth)\b/.test(request)) add('zoom_to_globe');
     if (/\b(flights?|planes?|aircraft|military|ships?|vessels?|earthquakes?|satellites?|fires?|traffic|cameras?|radio|bikes?|datacenters?|dams?|cables?|layers?)\b/.test(request)) add('set_layer_visibility', 'show_data_layers_menu');
     if (/\b(select|follow|nearest)\b/.test(request) && /\b(flight|plane|aircraft|military)\b/.test(request)) add('select_nearest_aircraft');
-    if (/\b(noir|retro|surveillance|thermal|anime|snow|visual style|filter)\b/.test(request)) add('set_visual_style');
+    if (/\b(noir|dark|detective|retro|surveillance|thermal|heat map|anime|snow|visual style|filter)\b/.test(request)) add('set_visual_style');
     if (/\b(panel|menu|open|close)\b/.test(request)) add('set_panel_open', 'show_data_layers_menu');
     if (/\b(context|contacts|space mission|mission)\b/.test(request)) add('set_context_mode', 'set_panel_open');
     if (/\b(cockpit)\b/.test(request)) add('control_cockpit');
     if (/\b(hud|overlay)\b/.test(request)) add('set_hud', 'set_detection');
     if (/\b(map|basemap|imagery)\b/.test(request)) add('set_map_stack');
     if (/\b(current|status|what.*view|where am i|selected|visible)\b/.test(request)) add('get_current_view_state', 'get_entity_context');
+    if (!wanted.size && asksForAction) add('fly_to_location', 'set_layer_visibility', 'set_visual_style', 'adjust_camera_zoom', 'set_panel_open');
     if (!wanted.size) return allTools;
     const filtered = allTools.filter((tool) => wanted.has(tool.name || tool.function?.name));
     return filtered.length ? filtered : allTools;
@@ -5088,6 +5092,29 @@ function localMlxProxy() {
     return data;
   };
 
+  // Do not let a compact planner silently discard an explicit destination in a
+  // multi-clause request. This only handles a clear named-place phrase and
+  // still leaves all ambiguous language to the model.
+  const addExplicitLocationCall = (data, tools, messages) => {
+    const message = data?.choices?.[0]?.message;
+    if (!message || !tools.some((tool) => tool?.function?.name === 'fly_to_location')) return data;
+    const text = messages.map((entry) => String(entry?.content || '')).join(' ');
+    const match = text.match(/\b(?:to|near|around|over|above|at|in)\s+(?:the\s+)?([A-Z][\p{L}\p{N}'-]*(?:\s+[A-Z][\p{L}\p{N}'-]*){0,3})/u);
+    if (!match || (message.tool_calls || []).some((call) => call?.function?.name === 'fly_to_location')) return data;
+    const place = match[1].trim();
+    const presets = new Set(['austin', 'sf', 'nyc', 'tokyo', 'london', 'paris', 'dubai', 'dc']);
+    const key = place.toLowerCase().replace(/\s+/g, ' ');
+    const argumentsObject = presets.has(key) ? { locationId: key } : { query: place };
+    message.tool_calls = [{
+      id: 'local_location_call',
+      type: 'function',
+      function: { name: 'fly_to_location', arguments: JSON.stringify(argumentsObject) },
+    }, ...(message.tool_calls || [])];
+    message.content = null;
+    if (data.choices?.[0]) data.choices[0].finish_reason = 'tool_calls';
+    return data;
+  };
+
   async function chatCompletion(payload) {
     const url = baseUrl();
     if (!url) throw new Error('LOCAL_MLX_BASE_URL is not set');
@@ -5148,7 +5175,7 @@ function localMlxProxy() {
         const data = await chatCompletion({
           messages: tools.length ? [{
             role: 'system',
-            content: 'You control God’s Eye View. Call tools for requested actions; do not explain JSON. Use set_layer_visibility for turning a layer on or off. Use select_nearest_aircraft only when the user explicitly asks to select or follow an aircraft.',
+            content: 'You control God’s Eye View. Interpret natural phrasing and every independent clause, then call the needed tools; never dismiss a control request as random words. A named place (including “take me to”, “near”, or “around”) requires fly_to_location. Use set_layer_visibility for turning a layer on or off, set_visual_style for visual moods such as dark/detective/noir, and adjust_camera_zoom for a little/relative zoom. Use select_nearest_aircraft only when the user explicitly asks to select or follow an aircraft. Do not explain JSON.',
           }, ...body.messages] : [{
             role: 'system',
             content: 'You are the local God’s Eye View voice assistant. Answer questions directly and briefly. You can discuss the map and its available controls; do not claim to have changed anything unless tool results say so.',
@@ -5159,7 +5186,7 @@ function localMlxProxy() {
           max_tokens: Math.min(512, Math.max(1, Number(body.max_tokens) || 256)),
           chat_template_kwargs: { enable_thinking: false },
         });
-        sendJson(res, 200, recoverToolCalls(data, tools));
+        sendJson(res, 200, addExplicitLocationCall(recoverToolCalls(data, tools), tools, body.messages));
       } catch (error) {
         sendJson(res, 503, { error: error?.message || 'Local MLX chat request failed' });
       }

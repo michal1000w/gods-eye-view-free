@@ -70,6 +70,40 @@ async function runSearch(viewer, options, { result = AUSTIN_RESULT, query = 'aus
   }
 }
 
+test('free-text search falls back to OpenStreetMap when no Google key is configured', async () => {
+  const hadWindow = Object.hasOwn(globalThis, 'window');
+  const priorWindow = globalThis.window;
+  const priorFetch = globalThis.fetch;
+  const viewer = stubViewer();
+  const requestedUrls = [];
+  globalThis.window = {};
+  globalThis.fetch = async (url) => {
+    requestedUrls.push(String(url));
+    if (!String(url).startsWith('https://nominatim.openstreetmap.org/search?')) {
+      return { ok: true, json: async () => ({ places: [] }) };
+    }
+    return {
+      ok: true,
+      json: async () => ([{
+        lat: '50.0870', lon: '14.4208', display_name: 'Prague, Czechia',
+        type: 'city', category: 'place', addresstype: 'city',
+        boundingbox: ['49.9419', '50.1774', '14.2245', '14.7068'],
+      }]),
+    };
+  };
+  try {
+    const destination = await searchAndFlyTo(viewer, 'Prague');
+    assert.match(requestedUrls[0], /^https:\/\/nominatim\.openstreetmap\.org\/search\?/);
+    assert.equal(destination?.label, 'Prague, Czechia');
+    assert.equal(destination?.navigationMode, 'city-overview');
+    assert.equal(viewer.flights.length, 1);
+  } finally {
+    globalThis.fetch = priorFetch;
+    if (hadWindow) globalThis.window = priorWindow;
+    else delete globalThis.window;
+  }
+});
+
 /** Read a recorded viewport flight back as a degrees rectangle. */
 function flownRectangleDegrees(viewer, index = 0) {
   const rectangle = viewer.flights[index]?.destination;

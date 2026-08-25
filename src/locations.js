@@ -342,27 +342,16 @@ export function findPoiByName(query) {
 export const CANCELLED_SEARCH = Object.freeze({ cancelled: true });
 
 /**
- * Geocode a place name using Google Geocoding API, then fly there at a scale
- * appropriate to the request. Countries and cities use their viewport by
- * default; precise landmarks/buildings use close landmark framing.
+ * Geocode a place name using the configured Google service when available, with
+ * OpenStreetMap's Nominatim service as a keyless fallback. The fallback keeps
+ * the LOCATION search useful in a fresh install (or when a Google key is
+ * restricted) rather than limiting navigation to the curated shortcut pills.
  */
 export async function searchAndFlyTo(viewer, query, options = {}) {
-  const apiKey = window.__GOOGLE_MAPS_API_KEY__ || import.meta.env.GOOGLE_MAPS_API_KEY;
-  if (!apiKey) throw new Error('No Google Maps API key available for geocoding');
-
   const beforeFly = typeof options.beforeFly === 'function' ? options.beforeFly : null;
   const mayFly = () => beforeFly === null || beforeFly() !== false;
 
-  // Viewport-biased geocode — the same bias annotationResolver's geocodePlace uses:
-  // "Sixth Street" spoken over Austin must prefer the Sixth Street on screen, not a
-  // same-named road in another city (or the wrong end of town — the W 6th vs E 6th bug).
-  let url = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(query)}&key=${apiKey}`;
-  const bias = viewportBias(viewer);
-  if (bias) url += `&bounds=${bias}`;
-  const response = await fetch(url);
-  const data = await response.json();
-
-  const result = (data.status === 'OK' && data.results?.length) ? data.results[0] : null;
+  const result = await geocodeLocation(viewer, query);
   let lat = result?.geometry.location.lat;
   let lng = result?.geometry.location.lng;
   let label = result ? result.formatted_address : null;
@@ -475,6 +464,84 @@ export async function searchAndFlyTo(viewer, query, options = {}) {
       : (options.forceClose ? navigationMode.replace('-overview', '-close') : navigationMode),
     rangeM: Math.round(flight.range),
   };
+}
+
+/**
+ * Return a Google-geocode-shaped result from the best available public geocoder.
+ * Keeping this adapter at the boundary lets the existing framing policy work the
+ * same way for cities, countries, landmarks, roads, parks, and OSM POIs.
+ */
+async function geocodeLocation(viewer, query) {
+  const apiKey = window.__GOOGLE_MAPS_API_KEY__ || import.meta.env?.GOOGLE_MAPS_API_KEY;
+  if (apiKey) {
+    try {
+      // Viewport-biased lookup keeps ambiguous local names (such as "Sixth
+      // Street") anchored near the current view when Google is configured.
+      let url = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(query)}&key=${apiKey}`;
+      const bias = viewportBias(viewer);
+      if (bias) url += `&bounds=${bias}`;
+      const response = await fetch(url);
+      const data = await response.json();
+      if (data.status === 'OK' && data.results?.length) return data.results[0];
+    } catch (error) {
+      // A network/CORS/API-key failure must not turn a general location search
+      // into a preset-only control. Fall through to the public geocoder.
+      console.warn('[Search] Google geocoding unavailable; using OpenStreetMap fallback.', error);
+    }
+  }
+
+  return geocodeWithNominatim(query);
+}
+
+/** Query Nominatim's broad OSM index and adapt its first result for this module. */
+async function geocodeWithNominatim(query) {
+  const url = new URL('https://nominatim.openstreetmap.org/search');
+  url.search = new URLSearchParams({
+    q: query,
+    format: 'jsonv2',
+    limit: '1',
+    addressdetails: '1',
+    'accept-language': globalThis.navigator?.language || 'en',
+  }).toString();
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`OpenStreetMap geocoding request failed (${response.status})`);
+  const [place] = await response.json();
+  return place ? nominatimResult(place) : null;
+}
+
+/** Adapt a Nominatim search record into the subset of Google's result shape we use. */
+function nominatimResult(place) {
+  const lat = Number(place?.lat);
+  const lng = Number(place?.lon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  const box = Array.isArray(place.boundingbox) ? place.boundingbox.map(Number) : [];
+  const [south, north, west, east] = box;
+  const viewport = [south, north, west, east].every(Number.isFinite)
+    ? { southwest: { lat: south, lng: west }, northeast: { lat: north, lng: east } }
+    : null;
+  return {
+    formatted_address: place.display_name || place.name || '',
+    types: nominatimTypes(place),
+    geometry: { location: { lat, lng }, viewport },
+  };
+}
+
+/** Map OSM's classes into the framing categories understood by geocodeNavigationMode. */
+function nominatimTypes(place) {
+  const type = String(place?.type || '').toLowerCase();
+  const category = String(place?.category || place?.class || '').toLowerCase();
+  const addressType = String(place?.addresstype || '').toLowerCase();
+  if (type === 'country' || addressType === 'country') return ['country'];
+  if (/(state|province|region|county|district|municipality)/.test(type) || /^(state|province|region|county)$/.test(addressType)) {
+    return ['administrative_area_level_1'];
+  }
+  if (/(city|town|village|hamlet|locality)/.test(type) || /^(city|town|village|hamlet)$/.test(addressType)) return ['locality'];
+  if (/(neighbourhood|neighborhood|suburb|quarter)/.test(type) || /^(neighbourhood|suburb|quarter)$/.test(addressType)) return ['neighborhood'];
+  if (category === 'highway' || type === 'road') return ['route'];
+  if (['park', 'nature_reserve', 'water', 'reservoir', 'university', 'aerodrome', 'stadium', 'zoo'].includes(type)) {
+    return [type === 'aerodrome' ? 'airport' : type === 'water' || type === 'reservoir' ? 'natural_feature' : type];
+  }
+  return [];
 }
 
 /** Places {low,high} viewport → the geocode {southwest,northeast} bounds shape
