@@ -259,6 +259,28 @@ src/
 
 See [`docs/CURRENT-STATE.md`](docs/CURRENT-STATE.md) for the authoritative runtime reference.
 
+### Local AI (Apple Silicon, no account or cloud API)
+
+For fast, private text inference, this repo supports **`Qwen/Qwen3-4B-MLX-4bit`**: an Apache-2.0 MLX model with a 2.14-GB download. It is the small-model quality/performance balance used here for reliable multi-tool commands, and MLX LM exposes it through an OpenAI-compatible local server.
+
+```bash
+# Local voice requires Python 3.10–3.12. On a current Homebrew setup:
+# brew install python@3.12
+PYTHON_BIN=/opt/homebrew/opt/python@3.12/bin/python3.12 npm run ai:setup
+npm run ai:serve                         # terminal 1 — this intentionally stays running
+# terminal 2 — local Whisper STT + Kokoro TTS service:
+npm run ai:voice-serve
+# terminal 3:
+LOCAL_MLX_BASE_URL=http://127.0.0.1:8080/v1 LOCAL_MLX_AUDIO_BASE_URL=http://127.0.0.1:8081/v1 npm run dev
+npm run ai:test                          # verifies a real function call
+```
+
+**GEV MIC** records a turn locally, transcribes it with Whisper, runs local Qwen3 tool selection, then speaks the response with Kokoro. The loopback URLs are built-in defaults; set `LOCAL_MLX_BASE_URL` or `LOCAL_MLX_AUDIO_BASE_URL` only to override them. No OpenAI key or audio leaves the machine. The model cache and virtual environment live in `.local-ai/`, which is ignored by Git.
+
+`npm run ai:setup` also installs the upstream Whisper processor files required by MLX-Audio's compact MLX Whisper conversion; rerun it after updating this project before starting the voice server.
+
+The setup script installs Kokoro's English `misaki`/spaCy text-processing dependencies inside `.local-ai/venv`; do not install them with the system or Conda `pip`.
+
 ---
 
 ## 🔑 API Keys

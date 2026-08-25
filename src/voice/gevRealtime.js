@@ -312,6 +312,10 @@ export class GevRealtimeController {
     this.shortcutBlurHandler = null;
     this.shortcutVisibilityHandler = null;
     this.status = 'idle';
+    this.localVoice = false;
+    this.localRecorder = null;
+    this.localChunks = [];
+    this.localSpeechAudioContext = null;
     // Monotonic generation token. Every start()/stop() bumps it; an in-flight
     // start() captures its value and bails after each await if it no longer
     // matches, so a stop() (or a second start()) mid-connect cannot leave an
@@ -342,8 +346,8 @@ export class GevRealtimeController {
     this.pushToTalkMode = pushToTalk;
     this.pushToTalkKeyHeld = pushToTalkKeyHeld;
     this.spaceKeyHeld = spaceKeyHeld;
-    if (!window.RTCPeerConnection || !navigator.mediaDevices?.getUserMedia) {
-      this.setStatus('error', 'WebRTC microphone support unavailable');
+    if (!navigator.mediaDevices?.getUserMedia) {
+      this.setStatus('error', 'Microphone support unavailable in this browser');
       return;
     }
 
@@ -373,7 +377,25 @@ export class GevRealtimeController {
     });
     let localStream = null;
     let localPc = null;
+    let localVoiceRequested = false;
     try {
+      // Create/resume synchronously from the MIC click. Safari and Chromium
+      // otherwise reject audio that arrives after transcription as autoplay.
+      this.unlockLocalSpeech();
+      // Prefer the fully local path when both local services are configured.
+      // It records one short turn, transcribes it on-device, invokes the MLX
+      // tool model, then speaks the reply with local Kokoro TTS.
+      const localStatus = await fetch('/api/local-ai/status', { cache: 'no-store' })
+        .then((response) => response.ok ? response.json() : null)
+        .catch(() => null);
+      if (localStatus?.chat && localStatus?.audio) {
+        localVoiceRequested = true;
+        await this.startLocalVoice(epoch);
+        return;
+      }
+      if (!window.RTCPeerConnection) {
+        throw new Error('WebRTC support is unavailable and no local voice backend is running');
+      }
       const minted = await fetchRealtimeToken(this.voiceTier);
       const token = minted.token;
       if (this.abandonStart(epoch, { localStream, localPc })) return;
@@ -506,8 +528,131 @@ export class GevRealtimeController {
       }
       const diagnostics = this.connectionDiagnostics();
       this.stop({ preserveStatus: true });
-      this.reportError('Realtime connection', error, diagnostics);
+      this.reportError(localVoiceRequested ? 'Local voice' : 'Realtime connection', error, diagnostics);
     }
+  }
+
+  async startLocalVoice(epoch) {
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+      });
+    } catch (error) {
+      if (error?.name === 'NotAllowedError' || error?.name === 'SecurityError') {
+        throw new Error('Microphone access is blocked. Allow Microphone for this browser in macOS System Settings → Privacy & Security → Microphone, then allow this site and reload.');
+      }
+      throw error;
+    }
+    if (this.abandonStart(epoch, { localStream: stream, localPc: null })) return;
+    if (!window.MediaRecorder) throw new Error('Browser MediaRecorder support unavailable for local voice');
+    this.localVoice = true;
+    this.stream = stream;
+    this.localChunks = [];
+    const recorder = MediaRecorder.isTypeSupported('audio/webm')
+      ? new MediaRecorder(stream, { mimeType: 'audio/webm' })
+      : new MediaRecorder(stream);
+    this.localRecorder = recorder;
+    recorder.ondataavailable = (event) => { if (event.data.size) this.localChunks.push(event.data); };
+    recorder.onstop = () => { void this.submitLocalVoiceTurn(); };
+    recorder.start();
+    this.startVoiceVisualizer(stream);
+    this.setStatus('listening', 'Local voice — click MIC when finished');
+  }
+
+  async submitLocalVoiceTurn() {
+    const blob = new Blob(this.localChunks, { type: this.localRecorder?.mimeType || 'audio/webm' });
+    this.localChunks = [];
+    this.localRecorder = null;
+    if (!blob.size) return;
+    try {
+      this.setStatus('executing', 'Transcribing locally');
+      const transcription = await fetch('/api/local-ai/transcriptions', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ audioBase64: await blobToBase64(blob), mimeType: blob.type }),
+      }).then(async (response) => {
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Local transcription failed');
+        return data;
+      });
+      const text = String(transcription.text || '').trim();
+      if (!text) throw new Error('No speech detected');
+      this.setStatus('executing', 'Thinking locally');
+      const answer = await fetch('/api/local-ai/chat', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: text }], temperature: 0.2, max_tokens: 160 }),
+      }).then(async (response) => {
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Local model failed');
+        return data;
+      });
+      const message = answer?.choices?.[0]?.message || {};
+      const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+      const results = [];
+      for (const call of calls.slice(0, 4)) {
+        const fn = call?.function;
+        if (!fn?.name) continue;
+        results.push(await this.runner(fn.name, parseArguments(fn.arguments)));
+      }
+      let reply = String(message.content || '').trim();
+      if (results.length) {
+        this.setStatus('executing', 'Preparing local response');
+        const followUp = await fetch('/api/local-ai/chat', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            messages: [
+              { role: 'user', content: text },
+              { role: 'assistant', content: null, tool_calls: calls },
+              ...results.map((result, index) => ({
+                role: 'tool',
+                tool_call_id: calls[index]?.id || `local_call_${index}`,
+                content: JSON.stringify(result),
+              })),
+              { role: 'user', content: 'Briefly confirm the completed actions and answer the request. Do not call any more tools.' },
+            ],
+            tools: [], temperature: 0.2, max_tokens: 100,
+          }),
+        }).then(async (response) => {
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.error || 'Local follow-up failed');
+          return data;
+        });
+        reply = String(followUp?.choices?.[0]?.message?.content || '').trim() || reply;
+      }
+      reply = reply || (results.length ? `Completed ${results.map((result) => result?.action || 'command').join(', ')}.` : 'I can answer questions or control the map.');
+      await this.speakLocal(reply);
+      this.setStatus('idle', 'LOCAL VOICE STANDBY');
+    } catch (error) {
+      this.reportError('Local voice', error);
+    }
+  }
+
+  async speakLocal(input) {
+    this.setVoiceSpeaker('ai');
+    const response = await fetch('/api/local-ai/speech', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ input }),
+    });
+    if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || 'Local speech synthesis failed');
+    const context = this.localSpeechAudioContext;
+    if (!context) throw new Error('Local audio was not initialized. Click MIC again to enable speech playback.');
+    const decoded = await context.decodeAudioData(await response.arrayBuffer());
+    await new Promise((resolve) => {
+      const source = context.createBufferSource();
+      source.buffer = decoded;
+      source.connect(context.destination);
+      source.onended = resolve;
+      source.start();
+    });
+    this.setVoiceSpeaker('idle');
+  }
+
+  unlockLocalSpeech() {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return;
+    if (!this.localSpeechAudioContext || this.localSpeechAudioContext.state === 'closed') {
+      this.localSpeechAudioContext = new AudioContextClass();
+    }
+    void this.localSpeechAudioContext.resume();
   }
 
   // Returns true (and tears down the just-acquired resources) when this start()
@@ -773,6 +918,8 @@ export class GevRealtimeController {
     // releases its own resources instead of promoting them onto a stopped
     // controller (H7).
     this.startEpoch++;
+    if (this.localRecorder?.state === 'recording') this.localRecorder.stop();
+    this.localVoice = false;
     this.radioHandoffEpoch++;
     for (const controller of this.activeToolAbortControllers) controller.abort();
     this.activeToolAbortControllers.clear();
@@ -2387,6 +2534,15 @@ function parseArguments(value) {
   } catch {
     return {};
   }
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || '').split(',')[1] || '');
+    reader.onerror = () => reject(reader.error || new Error('Could not read microphone recording'));
+    reader.readAsDataURL(blob);
+  });
 }
 
 function createErrorRecord(source, error, extra = {}) {

@@ -34,6 +34,10 @@
   "scripts": {
     "dev": "vite",
     "dev:secure": "./scripts/dev-secure.sh",
+    "ai:setup": "./scripts/local-ai-setup.sh",
+    "ai:serve": "./scripts/local-ai-serve.sh",
+    "ai:voice-serve": "./scripts/local-voice-serve.sh",
+    "ai:test": "node scripts/local-ai-smoke.mjs",
     "opensky:import": "./scripts/opensky-import-client.sh",
     "build": "vite build",
     "preview": "vite preview",

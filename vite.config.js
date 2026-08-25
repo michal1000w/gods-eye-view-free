@@ -4952,6 +4952,293 @@ function trackBackfillProxies() {
 }
 
 /**
+ * Vite plugin: a local MLX-LM bridge.
+ *
+ * mlx_lm.server is an OpenAI-compatible HTTP server. Keeping it on loopback
+ * means the browser never gets direct access to the model service, and the
+ * app keeps one same-origin API surface whether it uses local MLX or OpenAI.
+ */
+function localMlxProxy() {
+  // This project is local-first: the bundled scripts expose these loopback
+  // endpoints. Environment values remain overrides for alternate ports.
+  const baseUrl = () => (process.env.LOCAL_MLX_BASE_URL || 'http://127.0.0.1:8080/v1').replace(/\/$/, '');
+  const model = () => process.env.LOCAL_MLX_MODEL || 'Qwen/Qwen3-4B-MLX-4bit';
+  const audioBaseUrl = () => (process.env.LOCAL_MLX_AUDIO_BASE_URL || 'http://127.0.0.1:8081/v1').replace(/\/$/, '');
+  const sttModel = () => process.env.LOCAL_MLX_STT_MODEL || 'mlx-community/whisper-small.en-mlx';
+  const ttsModel = () => process.env.LOCAL_MLX_TTS_MODEL || 'mlx-community/Kokoro-82M-bf16';
+
+  // Realtime tool definitions are flat (`{ type, name, parameters }`), while
+  // the MLX OpenAI-compatible chat endpoint expects `{ type, function: {...} }`.
+  // Sending the former made Qwen describe JSON in prose rather than emit actual
+  // `message.tool_calls`, so translate only at this backend boundary.
+  const mlxTools = (tools) => tools.map((tool) => {
+    if (tool?.type !== 'function' || tool.function) return tool;
+    const { name, description, parameters, strict } = tool;
+    return {
+      type: 'function',
+      function: {
+        name,
+        ...(description ? { description } : {}),
+        ...(parameters ? { parameters } : {}),
+        ...(strict === undefined ? {} : { strict }),
+      },
+    };
+  });
+
+  // A 1.7B router is both faster and more accurate with a focused catalog.
+  // Preserve the complete catalog for unfamiliar requests, but avoid spending
+  // thousands of prompt tokens describing unrelated UI controls on common
+  // voice commands.
+  const relevantTools = (allTools, messages) => {
+    const request = messages.map((message) => String(message?.content || '')).join(' ').toLowerCase();
+    const asksForInformation = /\?|\b(what|why|how|who|when|where|tell me|explain)\b/.test(request);
+    const asksForAction = /\b(turn|switch|show|hide|open|close|fly|go|navigate|zoom|enable|disable|set|select|follow)\b/.test(request);
+    if (asksForInformation && !asksForAction) return [];
+    const wanted = new Set();
+    const add = (...names) => names.forEach((name) => wanted.add(name));
+    if (/\b(fly|go to|navigate|location|city|country|place|coordinate|latitude|longitude)\b/.test(request)) add('fly_to_location');
+    if (/\b(zoom|globe|earth|planet|closer|farther)\b/.test(request)) add('adjust_camera_zoom', 'zoom_to_globe');
+    if (/\b(flights?|planes?|aircraft|military|ships?|vessels?|earthquakes?|satellites?|fires?|traffic|cameras?|radio|bikes?|datacenters?|dams?|cables?|layers?)\b/.test(request)) add('set_layer_visibility', 'show_data_layers_menu');
+    if (/\b(select|follow|nearest)\b/.test(request) && /\b(flight|plane|aircraft|military)\b/.test(request)) add('select_nearest_aircraft');
+    if (/\b(noir|retro|surveillance|thermal|anime|snow|visual style|filter)\b/.test(request)) add('set_visual_style');
+    if (/\b(panel|menu|open|close)\b/.test(request)) add('set_panel_open', 'show_data_layers_menu');
+    if (/\b(context|contacts|space mission|mission)\b/.test(request)) add('set_context_mode', 'set_panel_open');
+    if (/\b(cockpit)\b/.test(request)) add('control_cockpit');
+    if (/\b(hud|overlay)\b/.test(request)) add('set_hud', 'set_detection');
+    if (/\b(map|basemap|imagery)\b/.test(request)) add('set_map_stack');
+    if (/\b(current|status|what.*view|where am i|selected|visible)\b/.test(request)) add('get_current_view_state', 'get_entity_context');
+    if (!wanted.size) return allTools;
+    const filtered = allTools.filter((tool) => wanted.has(tool.name || tool.function?.name));
+    return filtered.length ? filtered : allTools;
+  };
+
+  // Some small Qwen variants return one or more JSON command objects as
+  // message content when given a large tool catalog. Recover only valid calls
+  // to the tool names we offered, then expose the normal OpenAI response shape
+  // to the browser. This keeps execution gated by the existing client runner.
+  const recoverToolCalls = (data, tools) => {
+    const choice = data?.choices?.[0];
+    const message = choice?.message;
+    if (!message) return data;
+    const allowed = new Set(tools.map((tool) => tool?.function?.name).filter(Boolean));
+    const normalizeCall = (name, rawArguments, index) => {
+      if (!allowed.has(name)) return null;
+      let argumentsObject;
+      try {
+        argumentsObject = typeof rawArguments === 'string' ? JSON.parse(rawArguments) : rawArguments;
+      } catch { return null; }
+      if (!argumentsObject || typeof argumentsObject !== 'object' || Array.isArray(argumentsObject)) return null;
+      // Qwen occasionally abbreviates this common two-field schema as
+      // `{ flights: "on" }`. Expand it before the existing action runner sees it.
+      if (name === 'set_layer_visibility' && !argumentsObject.layerId) {
+        const entry = Object.entries(argumentsObject).find(([key]) => key !== 'enabled');
+        if (entry) {
+          const [layerId, enabled] = entry;
+          argumentsObject = {
+            layerId,
+            enabled: enabled === true || enabled === 'on' || enabled === 'true' || enabled === 1,
+          };
+        }
+      }
+      return {
+        id: `local_call_${index}`,
+        type: 'function',
+        function: { name, arguments: JSON.stringify(argumentsObject) },
+      };
+    };
+    const existingCalls = Array.isArray(message.tool_calls)
+      ? message.tool_calls.map((call, index) => normalizeCall(call?.function?.name, call?.function?.arguments, index)).filter(Boolean)
+      : [];
+    if (existingCalls.length) {
+      message.tool_calls = existingCalls;
+      return data;
+    }
+    const source = typeof message.content === 'string' ? message.content : '';
+    const objects = [];
+    let start = -1;
+    let depth = 0;
+    let quoted = false;
+    let escaped = false;
+    for (let index = 0; index < source.length; index += 1) {
+      const char = source[index];
+      if (quoted) {
+        if (escaped) escaped = false;
+        else if (char === '\\') escaped = true;
+        else if (char === '"') quoted = false;
+        continue;
+      }
+      if (char === '"') { quoted = true; continue; }
+      if (char === '{') {
+        if (depth === 0) start = index;
+        depth += 1;
+      } else if (char === '}' && depth) {
+        depth -= 1;
+        if (depth === 0 && start >= 0) {
+          try { objects.push(JSON.parse(source.slice(start, index + 1))); } catch { /* ignore prose JSON fragments */ }
+          start = -1;
+        }
+      }
+    }
+    const calls = objects.map((candidate, index) => normalizeCall(candidate?.name, candidate?.arguments, index)).filter(Boolean);
+    if (calls.length) {
+      message.tool_calls = calls;
+      message.content = null;
+      choice.finish_reason = 'tool_calls';
+    }
+    return data;
+  };
+
+  async function chatCompletion(payload) {
+    const url = baseUrl();
+    if (!url) throw new Error('LOCAL_MLX_BASE_URL is not set');
+    const response = await fetch(`${url}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: model(), ...payload }),
+      // First Metal inference includes model paging/compilation; subsequent
+      // turns are much faster, but do not abort a healthy cold local model.
+      signal: AbortSignal.timeout(90_000),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data?.error?.message || data?.error || `MLX HTTP ${response.status}`);
+    return data;
+  }
+
+  function install(middlewares) {
+    // The existing HUD uses this endpoint. Prefer the local model whenever it
+    // is configured, leaving the OpenAI route as an opt-in fallback.
+    middlewares.use('/api/local-ai/hud-summary', async (req, res) => {
+      if (req.method !== 'POST') return sendJson(res, 405, { error: 'Method not allowed' });
+      try {
+        const context = JSON.parse(await readRequestBody(req, 64 * 1024) || '{}');
+        const data = await chatCompletion({
+          messages: [
+            { role: 'system', content: "Write one concise intelligence-HUD summary for God's Eye View. Use only supplied labels. Output exactly five words, no punctuation or markdown." },
+            { role: 'user', content: JSON.stringify(context) },
+          ],
+          temperature: 0.2,
+          max_tokens: 20,
+          chat_template_kwargs: { enable_thinking: false },
+        });
+        const summary = toFiveWordHudSummary(data?.choices?.[0]?.message?.content);
+        if (!summary) throw new Error('Local MLX returned no summary');
+        sendJson(res, 200, { summary, error: null });
+      } catch (error) {
+        sendJson(res, 503, { error: error?.message || 'Local MLX HUD request failed' });
+      }
+    });
+
+    // A small, generic OpenAI-compatible tool-calling bridge. It intentionally
+    // returns tool_calls for the caller to execute; this dev server never runs
+    // arbitrary model-selected functions itself.
+    middlewares.use('/api/local-ai/chat', async (req, res) => {
+      if (req.method !== 'POST') return sendJson(res, 405, { error: 'Method not allowed' });
+      try {
+        const body = JSON.parse(await readRequestBody(req, 128 * 1024) || '{}');
+        if (!Array.isArray(body.messages) || body.messages.length === 0 || body.messages.length > 32) {
+          return sendJson(res, 400, { error: 'messages must be a non-empty array of at most 32 items' });
+        }
+        if (body.tools !== undefined && (!Array.isArray(body.tools) || body.tools.length > 32)) {
+          return sendJson(res, 400, { error: 'tools must be an array of at most 32 items' });
+        }
+        const requestedTools = body.tools === undefined
+          ? relevantTools(GEV_REALTIME_TOOLS, body.messages)
+          : body.tools;
+        const tools = mlxTools(requestedTools);
+        const data = await chatCompletion({
+          messages: tools.length ? [{
+            role: 'system',
+            content: 'You control God’s Eye View. Call tools for requested actions; do not explain JSON. Use set_layer_visibility for turning a layer on or off. Use select_nearest_aircraft only when the user explicitly asks to select or follow an aircraft.',
+          }, ...body.messages] : [{
+            role: 'system',
+            content: 'You are the local God’s Eye View voice assistant. Answer questions directly and briefly. You can discuss the map and its available controls; do not claim to have changed anything unless tool results say so.',
+          }, ...body.messages],
+          tools,
+          tool_choice: tools.length ? 'auto' : undefined,
+          temperature: Number.isFinite(body.temperature) ? Math.min(1, Math.max(0, body.temperature)) : 0.2,
+          max_tokens: Math.min(512, Math.max(1, Number(body.max_tokens) || 256)),
+          chat_template_kwargs: { enable_thinking: false },
+        });
+        sendJson(res, 200, recoverToolCalls(data, tools));
+      } catch (error) {
+        sendJson(res, 503, { error: error?.message || 'Local MLX chat request failed' });
+      }
+    });
+
+    middlewares.use('/api/local-ai/status', (_req, res) => {
+      sendJson(res, 200, {
+        chat: Boolean(baseUrl()),
+        audio: Boolean(audioBaseUrl()),
+        sttModel: sttModel(),
+        ttsModel: ttsModel(),
+      });
+    });
+
+    middlewares.use('/api/local-ai/transcriptions', async (req, res) => {
+      if (req.method !== 'POST') return sendJson(res, 405, { error: 'Method not allowed' });
+      try {
+        const audioUrl = audioBaseUrl();
+        if (!audioUrl) throw new Error('LOCAL_MLX_AUDIO_BASE_URL is not set');
+        const body = JSON.parse(await readRequestBody(req, 8 * 1024 * 1024) || '{}');
+        const bytes = Buffer.from(String(body.audioBase64 || ''), 'base64');
+        if (!bytes.length || bytes.length > 6 * 1024 * 1024) throw new Error('Audio must be a non-empty recording of at most 6 MB');
+        const form = new FormData();
+        form.append('model', sttModel());
+        form.append('file', new Blob([bytes], { type: body.mimeType || 'audio/webm' }), 'command.webm');
+        const response = await fetch(`${audioUrl}/audio/transcriptions`, {
+          method: 'POST', body: form, signal: AbortSignal.timeout(120_000),
+        });
+        const data = await response.json().catch(() => ({}));
+        sendJson(res, response.ok ? 200 : 503, response.ok ? data : { error: data?.error?.message || data?.error || 'Local transcription failed' });
+      } catch (error) {
+        sendJson(res, 503, { error: error?.message || 'Local transcription failed' });
+      }
+    });
+
+    middlewares.use('/api/local-ai/speech', async (req, res) => {
+      if (req.method !== 'POST') return sendJson(res, 405, { error: 'Method not allowed' });
+      try {
+        const audioUrl = audioBaseUrl();
+        if (!audioUrl) throw new Error('LOCAL_MLX_AUDIO_BASE_URL is not set');
+        const body = JSON.parse(await readRequestBody(req, 32 * 1024) || '{}');
+        const input = String(body.input || '').trim().slice(0, 600);
+        if (!input) throw new Error('input is required');
+        const response = await fetch(`${audioUrl}/audio/speech`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: ttsModel(), input, voice: body.voice || 'af_heart', response_format: 'wav' }),
+          signal: AbortSignal.timeout(120_000),
+        });
+        if (!response.ok) {
+          const data = await response.json().catch(() => ({}));
+          throw new Error(data?.error?.message || data?.error || `Local speech HTTP ${response.status}`);
+        }
+        const audio = Buffer.from(await response.arrayBuffer());
+        res.statusCode = 200;
+        res.setHeader('Content-Type', response.headers.get('content-type') || 'audio/wav');
+        res.setHeader('Cache-Control', 'no-store');
+        res.end(audio);
+      } catch (error) {
+        sendJson(res, 503, { error: error?.message || 'Local speech synthesis failed' });
+      }
+    });
+  }
+
+  return {
+    name: 'local-mlx-proxy',
+    configureServer(server) { install(server.middlewares); },
+    configurePreviewServer(server) { install(server.middlewares); },
+  };
+}
+
+function sendJson(res, status, body) {
+  res.statusCode = status;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.end(JSON.stringify(body));
+}
+
+/**
  * Vite plugin: OpenAI Realtime ephemeral client secret.
  *
  * Keeps OPENAI_API_KEY server-side while the browser connects to the
@@ -4969,6 +5256,40 @@ function openAiRealtimeProxy() {
 
       // Opt-in per-IP throttle (GEV_RATELIMIT_OPENAI_PER_MIN). No-op when unset.
       if (!enforceOptInRateLimit(openAiRateLimiter(), req, res)) return;
+
+      // Local MLX is the default HUD backend when configured. Voice stays on
+      // Realtime OpenAI because an ordinary text LLM cannot replace WebRTC
+      // speech input/output.
+      if (process.env.LOCAL_MLX_BASE_URL) {
+        try {
+          const context = JSON.parse(await readRequestBody(req, 64 * 1024) || '{}');
+          const localUrl = process.env.LOCAL_MLX_BASE_URL.replace(/\/$/, '');
+          const response = await fetch(`${localUrl}/chat/completions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: process.env.LOCAL_MLX_MODEL || 'Qwen/Qwen3-4B-MLX-4bit',
+              messages: [
+                { role: 'system', content: "Write one concise intelligence-HUD summary for God's Eye View. Use only supplied labels. Output exactly five words, no punctuation or markdown." },
+                { role: 'user', content: JSON.stringify(context) },
+              ],
+              temperature: 0.2,
+              max_tokens: 20,
+              chat_template_kwargs: { enable_thinking: false },
+            }),
+            signal: AbortSignal.timeout(12_000),
+          });
+          const data = await response.json().catch(() => ({}));
+          const summary = toFiveWordHudSummary(data?.choices?.[0]?.message?.content);
+          sendJson(res, response.ok && summary ? 200 : 503, {
+            summary: summary || null,
+            error: summary ? null : data?.error?.message || data?.error || 'Local MLX HUD request failed',
+          });
+        } catch (error) {
+          sendJson(res, 503, { error: error?.message || 'Local MLX HUD request failed' });
+        }
+        return;
+      }
 
       const apiKey = process.env.OPENAI_API_KEY;
       if (!apiKey) {
@@ -7358,6 +7679,7 @@ export default defineConfig(({ mode }) => {
       adsbLolProxy(),
       aisLiveProxy(),
       trackBackfillProxies(),
+      localMlxProxy(),
       openAiRealtimeProxy(),
       googlePlacesContextProxy(),
     ],
