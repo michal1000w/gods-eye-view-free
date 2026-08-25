@@ -4964,7 +4964,9 @@ function localMlxProxy() {
   const baseUrl = () => (process.env.LOCAL_MLX_BASE_URL || 'http://127.0.0.1:8080/v1').replace(/\/$/, '');
   const model = () => process.env.LOCAL_MLX_MODEL || 'Qwen/Qwen3-4B-MLX-4bit';
   const audioBaseUrl = () => (process.env.LOCAL_MLX_AUDIO_BASE_URL || 'http://127.0.0.1:8081/v1').replace(/\/$/, '');
-  const sttModel = () => process.env.LOCAL_MLX_STT_MODEL || 'mlx-community/whisper-small.en-mlx';
+  // Whisper Small is fast but hallucinates aggressively on low-information
+  // audio. Turbo is the supported high-quality MLX Audio default for voice.
+  const sttModel = () => process.env.LOCAL_MLX_STT_MODEL || 'mlx-community/whisper-large-v3-turbo-asr-fp16';
   const ttsModel = () => process.env.LOCAL_MLX_TTS_MODEL || 'mlx-community/Kokoro-82M-bf16';
 
   // Realtime tool definitions are flat (`{ type, name, parameters }`), while
@@ -5211,6 +5213,9 @@ function localMlxProxy() {
         if (!bytes.length || bytes.length > 6 * 1024 * 1024) throw new Error('Audio must be a non-empty recording of at most 6 MB');
         const form = new FormData();
         form.append('model', sttModel());
+        form.append('language', 'en');
+        form.append('temperature', '0');
+        form.append('prompt', 'Short spoken English commands for a geospatial globe application.');
         form.append('file', new Blob([bytes], { type: body.mimeType || 'audio/webm' }), 'command.webm');
         const response = await fetch(`${audioUrl}/audio/transcriptions`, {
           method: 'POST', body: form, signal: AbortSignal.timeout(120_000),

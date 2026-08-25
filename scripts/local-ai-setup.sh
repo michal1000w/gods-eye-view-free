@@ -5,7 +5,7 @@ set -eu
 # when your default `python3` is newer (for example: PYTHON_BIN=python3.12).
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 MODEL="${LOCAL_MLX_MODEL:-Qwen/Qwen3-4B-MLX-4bit}"
-STT_MODEL="${LOCAL_MLX_STT_MODEL:-mlx-community/whisper-small.en-mlx}"
+STT_MODEL="${LOCAL_MLX_STT_MODEL:-mlx-community/whisper-large-v3-turbo-asr-fp16}"
 TTS_MODEL="${LOCAL_MLX_TTS_MODEL:-mlx-community/Kokoro-82M-bf16}"
 # MLX Kokoro weights and its voice packs are published separately. The server
 # loads a selected voice lazily from this upstream repository.
@@ -14,11 +14,30 @@ ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 VENV="$ROOT/.local-ai/venv"
 HF_HOME="$ROOT/.local-ai/huggingface"
 
-"$PYTHON_BIN" - <<'PY'
+python_supported() {
+  "$1" - <<'PY' >/dev/null 2>&1
 import sys
 if not ((3, 10) <= sys.version_info[:2] <= (3, 12)):
     raise SystemExit('Local voice needs Python 3.10–3.12; rerun with PYTHON_BIN=python3.12')
 PY
+}
+
+# macOS often points `python3` at a newer Homebrew interpreter while a
+# compatible 3.12 is installed alongside it. Choose the latter automatically
+# so `npm run ai:setup` works without a shell-specific override.
+if ! python_supported "$PYTHON_BIN"; then
+  for candidate in python3.12 python3.11 python3.10; do
+    if command -v "$candidate" >/dev/null 2>&1 && python_supported "$candidate"; then
+      PYTHON_BIN="$candidate"
+      break
+    fi
+  done
+fi
+
+if ! python_supported "$PYTHON_BIN"; then
+  printf '%s\n' 'Local voice needs Python 3.10–3.12. Install one, then rerun npm run ai:setup.' >&2
+  exit 1
+fi
 
 if [ -x "$VENV/bin/python" ] && ! "$VENV/bin/python" - <<'PY'
 import sys
@@ -60,9 +79,9 @@ if not (voice_path / 'voices' / 'af_heart.safetensors').exists():
     raise SystemExit(f'Kokoro voice pack af_heart was not found in {voice_path}')
 print(f'Downloaded and verified Kokoro voice packs at {voice_path}')
 
-# mlx-community's compact Whisper conversion contains MLX weights but not the
-# Hugging Face processor. mlx-audio needs those tokenizer/config files at
-# transcription time, so cache the matching upstream processor alongside it.
+# The legacy compact Whisper conversion contains MLX weights but not the
+# Hugging Face processor. Keep this compatibility path for explicit overrides;
+# the default Whisper Large v3 Turbo package is self-contained.
 if "$STT_MODEL" == 'mlx-community/whisper-small.en-mlx':
     processor_files = [
         'preprocessor_config.json', 'tokenizer.json', 'tokenizer_config.json',
