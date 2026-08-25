@@ -22,6 +22,34 @@ import { normalizeRadioCountryInput } from '../data/radioCountry.js';
 import { TR3B_CLASS } from '../data/tr3bRegistry.js';
 
 const ALLOWED_STYLES = new Set(['normal', 'retro', 'surveillance', 'thermal', 'anime', 'noir', 'snow']);
+// Realtime models occasionally omit a separator in an otherwise valid tool
+// name (for example, `adjust_camerazoom`).  Keep this list deliberately
+// closed: recovery may repair spelling *formatting*, but must never guess a
+// different command or widen the set of actions the model can invoke.
+const GEV_TOOL_NAMES = new Set([
+  'adjust_camera_zoom', 'analyst_query', 'annotate_map', 'clear_annotations',
+  'control_cctv', 'control_cockpit', 'control_radio', 'control_scene',
+  'fly_route', 'fly_to_location', 'frame_overhead', 'get_current_view_state',
+  'get_entity_context', 'move_camera', 'next_iss_pass', 'select_nearest_aircraft',
+  'set_context_mode', 'set_detection', 'set_hud', 'set_layer_visibility',
+  'set_map_stack', 'set_panel_open', 'set_post_processing', 'set_visual_style',
+  'show_data_layers_menu', 'stop_tracking', 'track_entity', 'zoom_to_globe',
+]);
+
+/**
+ * Repairs only separator/case drift in a known tool name. Unknown names stay
+ * unknown so the normal error path remains useful and safe.
+ */
+export function normalizeGevToolName(name) {
+  const requested = String(name || '').trim().toLowerCase();
+  if (GEV_TOOL_NAMES.has(requested)) return requested;
+  const compact = requested.replace(/[^a-z0-9]/g, '');
+  if (!compact) return requested;
+  for (const knownName of GEV_TOOL_NAMES) {
+    if (knownName.replaceAll('_', '') === compact) return knownName;
+  }
+  return requested;
+}
 const PANEL_ALIASES = new Map([
   ['data', 'data-panel'],
   ['data layers', 'data-panel'],
@@ -287,6 +315,7 @@ export function createGevActionRunner({ viewer, styleManager, dataManager, scene
   installViewTargetPrewarm(viewer);
   initCameraVerbs(viewer, getViewTargetCartesian);
   return async function runGevAction(name, rawArgs = {}, runOptions = {}) {
+    name = normalizeGevToolName(name);
     const args = rawArgs && typeof rawArgs === 'object' ? rawArgs : {};
     const current = () => !runOptions.signal?.aborted
       && (typeof runOptions.isCurrent !== 'function' || runOptions.isCurrent());

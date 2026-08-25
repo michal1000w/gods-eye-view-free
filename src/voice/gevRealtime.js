@@ -1,4 +1,4 @@
-import { createGevActionRunner, readLayerLifecycleSummary } from './gevActions.js';
+import { createGevActionRunner, normalizeGevToolName, readLayerLifecycleSummary } from './gevActions.js';
 import {
   DEFAULT_VOICE_TIER,
   VOICE_COST_LIMITS,
@@ -2604,7 +2604,11 @@ function extractFunctionCalls(event) {
     calls.push(event.item);
   }
 
-  return calls.filter((call) => call?.name);
+  return calls.filter((call) => call?.name).map((call) => {
+    const requestedName = String(call.name);
+    const name = normalizeGevToolName(requestedName);
+    return name === requestedName ? call : { ...call, name, requestedName };
+  });
 }
 
 // True when an error payload is the benign result of deleting a viewport
@@ -2913,7 +2917,7 @@ function createVoiceControl({ reset = false } = {}) {
           <button class="gev-voice-error-dismiss" type="button">DISMISS</button>
         </div>
         <div id="gev-voice-error-detail"></div>
-        <div class="gev-voice-error-hint">Check microphone permission and network access, then try again.</div>
+        <div class="gev-voice-error-hint">The command was not completed. Try again; if voice cannot connect, check microphone permission and network access.</div>
       </div>
     `;
     const commandDock = document.getElementById('command-dock');

@@ -5028,7 +5028,15 @@ function localMlxProxy() {
     if (!message) return data;
     const allowed = new Set(tools.map((tool) => tool?.function?.name).filter(Boolean));
     const normalizeCall = (name, rawArguments, index) => {
-      if (!allowed.has(name)) return null;
+      const requestedName = String(name || '').trim().toLowerCase();
+      // Repair only separator/case drift in a tool that this request actually
+      // exposed. This covers compact-model output such as
+      // `adjust_camerazoom`, without turning an unknown command into a guess.
+      const compactName = requestedName.replace(/[^a-z0-9]/g, '');
+      const normalizedName = allowed.has(requestedName)
+        ? requestedName
+        : [...allowed].find((toolName) => toolName.replaceAll('_', '') === compactName);
+      if (!normalizedName) return null;
       let argumentsObject;
       try {
         argumentsObject = typeof rawArguments === 'string' ? JSON.parse(rawArguments) : rawArguments;
@@ -5036,7 +5044,7 @@ function localMlxProxy() {
       if (!argumentsObject || typeof argumentsObject !== 'object' || Array.isArray(argumentsObject)) return null;
       // Qwen occasionally abbreviates this common two-field schema as
       // `{ flights: "on" }`. Expand it before the existing action runner sees it.
-      if (name === 'set_layer_visibility' && !argumentsObject.layerId) {
+      if (normalizedName === 'set_layer_visibility' && !argumentsObject.layerId) {
         const entry = Object.entries(argumentsObject).find(([key]) => key !== 'enabled');
         if (entry) {
           const [layerId, enabled] = entry;
@@ -5049,7 +5057,7 @@ function localMlxProxy() {
       return {
         id: `local_call_${index}`,
         type: 'function',
-        function: { name, arguments: JSON.stringify(argumentsObject) },
+        function: { name: normalizedName, arguments: JSON.stringify(argumentsObject) },
       };
     };
     const existingCalls = Array.isArray(message.tool_calls)

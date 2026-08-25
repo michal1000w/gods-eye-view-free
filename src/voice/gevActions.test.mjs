@@ -14,7 +14,14 @@ import {
   cctvVoiceFocusOutcome,
   formatTrackedEntityLabel,
   knownRadioLocation,
+  normalizeGevToolName,
 } from './gevActions.js';
+
+test('tool-name recovery repairs only separator and case drift', () => {
+  assert.equal(normalizeGevToolName('adjust_camerazoom'), 'adjust_camera_zoom');
+  assert.equal(normalizeGevToolName('ADJUST-CAMERA-ZOOM'), 'adjust_camera_zoom');
+  assert.equal(normalizeGevToolName('adjust_camera_zoom_now'), 'adjust_camera_zoom_now');
+});
 
 test('track_entity narration names aircraft callsign → registration → icao24', () => {
   const found = { callsign: 'SWA696', registration: 'N123AB', icao24: 'ae1fa4' };
