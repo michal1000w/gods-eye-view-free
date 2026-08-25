@@ -3,33 +3,28 @@ import { governorRequestRender } from './renderGovernor.js';
 
 export const MAP_STACKS = [
   {
-    id: 'photoreal',
-    label: 'Google 3D',
-    shortLabel: '3D',
-    kind: 'photoreal',
+    id: 'osm',
+    label: 'OpenStreetMap',
+    shortLabel: 'OSM',
+    kind: 'osm',
     requiresIon: false,
   },
   {
-    id: 'bing-aerial',
-    label: 'Bing Aerial',
-    shortLabel: 'Aerial',
-    kind: 'ion',
-    style: Cesium.IonWorldImageryStyle.AERIAL,
-    requiresIon: true,
+    id: 'opentopo',
+    label: 'OpenTopoMap',
+    shortLabel: 'Topo',
+    kind: 'url',
+    url: 'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',
+    credit: '© OpenTopoMap contributors',
+    requiresIon: false,
   },
   {
-    id: 'bing-labels',
-    label: 'Bing Labels',
-    shortLabel: 'Labels',
-    kind: 'ion',
-    style: Cesium.IonWorldImageryStyle.AERIAL_WITH_LABELS,
-    requiresIon: true,
-  },
-  {
-    id: 'osm',
-    label: 'OSM',
-    shortLabel: 'OSM',
-    kind: 'osm',
+    id: 'osm-humanitarian',
+    label: 'OSM Humanitarian',
+    shortLabel: 'HOT',
+    kind: 'url',
+    url: 'https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png',
+    credit: '© OpenStreetMap contributors, Tiles style by HOT',
     requiresIon: false,
   },
 ];
@@ -45,15 +40,13 @@ const DEFAULT_OSM_CREDIT = '© OpenStreetMap contributors';
 const REEARTH_TERRAIN_URL = 'https://terrain.reearth.land/cesium-mesh/ellipsoid';
 
 /**
- * Controls the active globe/map stack. Google Photorealistic 3D Tiles remain
- * the cinematic default, while Cesium ion world imagery and OSM run as globe
- * imagery stacks.
+ * Controls the active, keyless open-data globe/map stack.
  */
 export class MapStackController {
   constructor(viewer, {
     googleTileset = null,
     cesiumToken = '',
-    initialStack = 'photoreal',
+    initialStack = 'osm',
     onChange = null,
     onError = null,
   } = {}) {
@@ -62,7 +55,7 @@ export class MapStackController {
     this.cesiumToken = String(cesiumToken || '').trim();
     this._onChange = onChange;
     this._onError = onError;
-    this._activeId = googleTileset ? initialStack : 'osm';
+    this._activeId = initialStack;
     this._imageryLayer = null;
     this._imageryProviders = new Map();
     this._isSwitching = false;
@@ -89,7 +82,7 @@ export class MapStackController {
     this._switchGen = 0;
 
     if (!this.getStack(this._activeId) || !this.isStackAvailable(this._activeId)) {
-      this._activeId = googleTileset ? 'photoreal' : 'osm';
+      this._activeId = 'osm';
     }
   }
 
@@ -155,7 +148,7 @@ export class MapStackController {
   }
 
   async setStack(id, { silent = false } = {}) {
-    const stack = this.getStack(id) || this.getStack('photoreal');
+    const stack = this.getStack(id) || this.getStack('osm');
     if (!stack) return null;
 
     if (!this.isStackAvailable(stack.id)) {
@@ -254,12 +247,16 @@ export class MapStackController {
     }
 
     let provider;
-    if (stack.kind === 'ion') {
-      provider = await Cesium.createWorldImageryAsync({ style: stack.style });
-    } else if (stack.kind === 'osm') {
+    if (stack.kind === 'osm') {
       provider = new Cesium.OpenStreetMapImageryProvider({
         url: 'https://tile.openstreetmap.org/',
         credit: DEFAULT_OSM_CREDIT,
+      });
+    } else if (stack.kind === 'url') {
+      provider = new Cesium.UrlTemplateImageryProvider({
+        url: stack.url,
+        subdomains: ['a', 'b', 'c'],
+        credit: stack.credit,
       });
     } else {
       throw new Error(`Unsupported map stack: ${stack.id}`);

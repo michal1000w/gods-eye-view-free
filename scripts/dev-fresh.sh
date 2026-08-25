@@ -44,41 +44,6 @@ read_dotenv_value() {
   node scripts/read-dotenv-value.mjs "${variable_name}"
 }
 
-# Vite loads .env for browser build-time configuration, but this launcher needs
-# the Maps key before Vite starts. Preserve a shell-provided value; otherwise
-# read the project-local .env without executing it as shell code.
-GOOGLE_MAPS_API_KEY_ENV="${GOOGLE_MAPS_API_KEY:-}"
-GOOGLE_MAPS_API_KEY_ENV_SOURCE="env"
-if [[ -z "${GOOGLE_MAPS_API_KEY_ENV}" && -f ".env" ]]; then
-  GOOGLE_MAPS_API_KEY_ENV="$(read_dotenv_value "GOOGLE_MAPS_API_KEY")"
-  GOOGLE_MAPS_API_KEY_ENV_SOURCE=".env"
-fi
-GOOGLE_MAPS_API_KEY_KEYCHAIN=""
-GOOGLE_MAPS_API_KEY_SOURCE=""
-if command -v security >/dev/null 2>&1; then
-  for acct in "api-key" "default" "key"; do
-    GOOGLE_MAPS_API_KEY_KEYCHAIN="$(security find-generic-password -s "google-maps-api" -a "${acct}" -w 2>/dev/null || true)"
-    if [[ -n "${GOOGLE_MAPS_API_KEY_KEYCHAIN}" ]]; then
-      GOOGLE_MAPS_API_KEY_SOURCE="keychain:${acct}"
-      break
-    fi
-  done
-fi
-
-if [[ -n "${GOOGLE_MAPS_API_KEY_KEYCHAIN}" ]]; then
-  GOOGLE_MAPS_API_KEY="${GOOGLE_MAPS_API_KEY_KEYCHAIN}"
-elif [[ -n "${GOOGLE_MAPS_API_KEY_ENV}" ]]; then
-  GOOGLE_MAPS_API_KEY="${GOOGLE_MAPS_API_KEY_ENV}"
-  GOOGLE_MAPS_API_KEY_SOURCE="${GOOGLE_MAPS_API_KEY_ENV_SOURCE}"
-else
-  GOOGLE_MAPS_API_KEY=""
-fi
-if [[ -z "${GOOGLE_MAPS_API_KEY}" ]]; then
-  echo "error: Google Maps API key missing."
-  echo "set GOOGLE_MAPS_API_KEY in env, or add Keychain item: service=google-maps-api account=api-key"
-  exit 1
-fi
-
 read_keychain_secret() {
   local service="$1"
   local account="$2"
@@ -270,7 +235,6 @@ case "${HOST}" in
     echo "URL (this machine): http://localhost:${PORT}/"
     ;;
 esac
-echo "Google Maps key source: ${GOOGLE_MAPS_API_KEY_SOURCE}"
 echo "Tip: after server starts, hard refresh browser (Cmd+Shift+R)."
 echo "If panels are still missing, run this once in browser console:"
 echo "localStorage.removeItem('godsEyeView.v6.panelPos.cctv-panel'); location.reload();"
@@ -337,7 +301,6 @@ put_env_if_set() {
   fi
 }
 
-put_env GOOGLE_MAPS_API_KEY "${GOOGLE_MAPS_API_KEY}"
 put_env CCTV_AUSTIN_MAX_SOURCES "${CCTV_AUSTIN_MAX_SOURCES}"
 # Empty is the documented Caltrans kill switch, so this one is passed as-is.
 put_env CCTV_CALTRANS_DISTRICTS "${CCTV_CALTRANS_DISTRICTS}"

@@ -63,7 +63,7 @@ function describeError(error) {
 
 /**
  * GOD'S EYE VIEW — Main Entry Point
- * Initializes CesiumJS with Google Photorealistic 3D Tiles,
+ * Initializes CesiumJS with a keyless open-data globe,
  * style system, intelligence HUD, location presets, and share links.
  */
 async function init() {
@@ -72,22 +72,6 @@ async function init() {
 
   try {
     loaderStatus.textContent = 'Configuring viewer...';
-
-    // Set Cesium Ion token for World Terrain
-    const cesiumToken = import.meta.env.CESIUM_ION_TOKEN;
-    if (cesiumToken) {
-      Cesium.Ion.defaultAccessToken = cesiumToken;
-    }
-
-    // Set Google Maps API key for 3D Tiles
-    const googleApiKey = import.meta.env.GOOGLE_MAPS_API_KEY;
-    if (!googleApiKey) {
-      throw new Error('GOOGLE_MAPS_API_KEY not found. Set it as an environment variable.');
-    }
-    Cesium.GoogleMaps.defaultApiKey = googleApiKey;
-
-    // Expose API key globally for geocoding in locations.js
-    window.__GOOGLE_MAPS_API_KEY__ = googleApiKey;
 
     // Create the Cesium viewer with minimal chrome
     const viewer = new Cesium.Viewer('cesiumContainer', {
@@ -103,13 +87,7 @@ async function init() {
       selectionIndicator: false,
       infoBox: false,
       baseLayer: false,
-      // Visible attribution container — Google Maps / 3D Tiles credits are
-      // required by Google's Terms of Service, so they must be shown (styled
-      // subtly via #cesium-credits). The credit line stays visible in
-      // clean-view AND recording modes too (ToS requires attribution while the
-      // content is displayed — those are the exact modes used to record
-      // demos), including the "Data attribution" link that opens the per-layer
-      // license popover.
+      // Visible attribution container for the selected open-data map source.
       creditContainer: (() => {
         const el = document.createElement('div');
         el.id = 'cesium-credits';
@@ -140,44 +118,21 @@ async function init() {
     // clutter the on-globe attribution line.
     registerDataCredits(viewer);
 
-    // Hide Cesium's default globe — Google Photorealistic 3D Tiles provide their own
-    // globe at all LODs (street level → orbital). The default globe's 2D imagery
-    // clips through 3D tile buildings at close range.
-    viewer.scene.globe.show = false;
+    // Keep Cesium's globe visible for the keyless imagery stacks.
+    viewer.scene.globe.show = true;
 
-    // Keep a sky behind Google 3D Tiles, but soften Cesium's high-intensity
-    // default atmosphere. With the globe hidden its bright limb otherwise
-    // reads as a hard cyan seam where distant photoreal tiles meet the sky.
+    // Soften Cesium's high-intensity default atmosphere.
     viewer.scene.skyAtmosphere.show = true;
     viewer.scene.skyAtmosphere.atmosphereLightIntensity = 18;
     viewer.scene.skyAtmosphere.saturationShift = -0.12;
     viewer.scene.skyAtmosphere.brightnessShift = -0.08;
 
-    loaderStatus.textContent = 'Loading Google 3D Tiles...';
     let tileset = null;
-    try {
-      // Load Google Photorealistic 3D Tiles
-      tileset = await Cesium.createGooglePhotorealistic3DTileset({
-        onlyUsingWithGoogleGeocoder: true,
-      });
-      viewer.scene.primitives.add(tileset);
-      // NOTE: Cesium World Terrain intentionally disabled — conflicts with Google 3D Tiles at high zoom.
-      // Google Photorealistic 3D Tiles provide their own terrain/elevation.
-      viewer.scene.globe.show = false;
-    } catch (tileError) {
-      console.warn('[Init] Google 3D Tiles unavailable, falling back to Cesium globe:', tileError);
-      const tileErrorDetail = describeError(tileError);
-      loaderStatus.textContent = `Google 3D Tiles unavailable (${tileErrorDetail}). Continuing in fallback mode...`;
-      // Keep Cesium globe visible as fallback instead of aborting the app.
-      viewer.scene.globe.show = true;
-    }
-
     loaderStatus.textContent = 'Initializing systems...';
 
     const mapStackController = new MapStackController(viewer, {
       googleTileset: tileset,
-      cesiumToken,
-      initialStack: tileset ? 'photoreal' : 'osm',
+      initialStack: 'osm',
       // Task 5 (height-datum fix): rebroadcast stack changes as a window
       // CustomEvent so data layers (CCTV per-regime ground resolution) can
       // react without coupling MapStackController to layer modules. Fires on
@@ -188,7 +143,7 @@ async function init() {
       },
       onError: (message) => console.warn('[MapStack]', message),
     });
-    await mapStackController.setStack(tileset ? 'photoreal' : 'osm', { silent: true });
+    await mapStackController.setStack('osm', { silent: true });
 
     // Initialize the style manager (post-processing, HUD, locations, share links)
     const styleManager = new StyleManager(viewer, { mapStackController });

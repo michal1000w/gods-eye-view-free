@@ -12,10 +12,9 @@
 
 export const MAP_STACK_CHIP_CLASS = 'map-stack-chip';
 export const PRESENTED_MAP_STACK_IDS = Object.freeze([
-  'photoreal',
-  'bing-aerial',
-  'bing-labels',
   'osm',
+  'opentopo',
+  'osm-humanitarian',
 ]);
 
 /**
