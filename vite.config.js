@@ -5461,8 +5461,13 @@ function openAiRealtimeProxy() {
                 prompt: 'Short spoken English commands for a geospatial globe application. Transcribe only words actually spoken. Do not add instructions, filler, or guessed text.',
               },
               turn_detection: {
-                type: 'semantic_vad',
-                eagerness: 'low',
+                // Command turns should stop at actual silence. The former
+                // low-eagerness semantic mode can hold a turn open for up to
+                // eight seconds, feeding trailing room noise into ASR.
+                type: 'server_vad',
+                threshold: 0.62,
+                prefix_padding_ms: 300,
+                silence_duration_ms: 650,
                 create_response: true,
                 interrupt_response: false,
               },

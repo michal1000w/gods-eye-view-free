@@ -317,6 +317,8 @@ export class GevRealtimeController {
     this.localRecorder = null;
     this.localChunks = [];
     this.localSpeechAudioContext = null;
+    this.localVoiceInput = null;
+    this.localVoiceSilenceTimer = null;
     // Monotonic generation token. Every start()/stop() bumps it; an in-flight
     // start() captures its value and bails after each await if it no longer
     // matches, so a stop() (or a second start()) mid-connect cannot leave an
@@ -427,7 +429,9 @@ export class GevRealtimeController {
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: true,
+          // AGC raises the gain during a pause, which is exactly when room
+          // noise gets amplified into a false speech turn.
+          autoGainControl: false,
           channelCount: 1,
         },
       });
@@ -537,7 +541,7 @@ export class GevRealtimeController {
     let stream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false, channelCount: 1 },
       });
     } catch (error) {
       if (error?.name === 'NotAllowedError' || error?.name === 'SecurityError') {
@@ -549,16 +553,42 @@ export class GevRealtimeController {
     if (!window.MediaRecorder) throw new Error('Browser MediaRecorder support unavailable for local voice');
     this.localVoice = true;
     this.stream = stream;
+    this.localVoiceInput = createNoiseGatedMicrophoneStream(stream);
+    const recordingStream = this.localVoiceInput.stream || stream;
     this.localChunks = [];
     const recorder = MediaRecorder.isTypeSupported('audio/webm')
-      ? new MediaRecorder(stream, { mimeType: 'audio/webm' })
-      : new MediaRecorder(stream);
+      ? new MediaRecorder(recordingStream, { mimeType: 'audio/webm' })
+      : new MediaRecorder(recordingStream);
     this.localRecorder = recorder;
     recorder.ondataavailable = (event) => { if (event.data.size) this.localChunks.push(event.data); };
-    recorder.onstop = () => { void this.submitLocalVoiceTurn(); };
+    recorder.onstop = () => {
+      if (this.localVoiceSilenceTimer) clearInterval(this.localVoiceSilenceTimer);
+      this.localVoiceSilenceTimer = null;
+      void this.submitLocalVoiceTurn();
+    };
     recorder.start();
     this.startVoiceVisualizer(stream);
+    this.startLocalVoiceSilenceWatcher(recorder);
     this.setStatus('listening', 'Local voice — click MIC when finished');
+  }
+
+  /** End a local recording as soon as an actual spoken turn has finished. */
+  startLocalVoiceSilenceWatcher(recorder) {
+    if (this.localVoiceSilenceTimer) clearInterval(this.localVoiceSilenceTimer);
+    let heardSpeech = false;
+    let silenceStartedAt = 0;
+    this.localVoiceSilenceTimer = setInterval(() => {
+      if (recorder !== this.localRecorder || recorder.state !== 'recording') return;
+      const level = this.localVoiceInput?.level?.() || 0;
+      if (level >= 0.025) {
+        heardSpeech = true;
+        silenceStartedAt = 0;
+        return;
+      }
+      if (!heardSpeech) return;
+      if (!silenceStartedAt) silenceStartedAt = performance.now();
+      if (performance.now() - silenceStartedAt >= 850) recorder.stop();
+    }, 80);
   }
 
   async submitLocalVoiceTurn() {
@@ -576,7 +606,7 @@ export class GevRealtimeController {
         if (!response.ok) throw new Error(data.error || 'Local transcription failed');
         return data;
       });
-      const text = sanitizeVoiceTranscript(transcription.text);
+      const text = String(transcription.text || '').trim();
       if (!text) throw new Error('No speech detected');
       this.logVoiceActivity('user', text);
       this.setStatus('executing', 'Thinking locally');
@@ -930,6 +960,8 @@ export class GevRealtimeController {
     // releases its own resources instead of promoting them onto a stopped
     // controller (H7).
     this.startEpoch++;
+    if (this.localVoiceSilenceTimer) clearInterval(this.localVoiceSilenceTimer);
+    this.localVoiceSilenceTimer = null;
     if (this.localRecorder?.state === 'recording') this.localRecorder.stop();
     this.localVoice = false;
     this.radioHandoffEpoch++;
@@ -980,10 +1012,14 @@ export class GevRealtimeController {
     this._tearingDown = false;
     if (this.stream) {
       this.stopVoiceVisualizer();
+      this.localVoiceInput?.stop?.();
+      this.localVoiceInput = null;
       this.stream.getTracks().forEach((track) => track.stop());
       this.stream = null;
     } else {
       this.stopVoiceVisualizer();
+      this.localVoiceInput?.stop?.();
+      this.localVoiceInput = null;
     }
     if (this.audioEl) {
       this.audioEl.remove();
@@ -1662,7 +1698,7 @@ export class GevRealtimeController {
   recordVoiceActivityFromRealtime(payload) {
     const type = payload?.type || '';
     if (type === 'conversation.item.input_audio_transcription.completed') {
-      const transcript = sanitizeVoiceTranscript(payload.transcript);
+      const transcript = String(payload.transcript || '').trim();
       if (transcript) this.logVoiceActivity('user', transcript, { id: `user-${payload.item_id || Date.now()}` });
       return;
     }
@@ -2615,6 +2651,78 @@ function blobToBase64(blob) {
   });
 }
 
+/**
+ * Build a clean microphone stream for the local recorder. The gate operates
+ * on audio samples before they leave the browser: low-level room tone is
+ * attenuated to silence, while normal speech opens quickly and closes gently
+ * so it does not clip word endings. Browsers without ScriptProcessor support
+ * simply retain the original stream.
+ */
+function createNoiseGatedMicrophoneStream(stream) {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass || !stream || !window.ScriptProcessorNode) {
+    return { stream, level: () => 0, stop() {} };
+  }
+  let context = null;
+  let source = null;
+  let highpass = null;
+  let compressor = null;
+  let gate = null;
+  let destination = null;
+  let inputLevel = 0;
+  let gateGain = 0;
+  try {
+    context = new AudioContextClass();
+    source = context.createMediaStreamSource(stream);
+    highpass = context.createBiquadFilter();
+    highpass.type = 'highpass';
+    highpass.frequency.value = 100;
+    highpass.Q.value = 0.7;
+    compressor = context.createDynamicsCompressor();
+    compressor.threshold.value = -30;
+    compressor.knee.value = 18;
+    compressor.ratio.value = 3;
+    compressor.attack.value = 0.003;
+    compressor.release.value = 0.15;
+    gate = context.createScriptProcessor(1024, 1, 1);
+    destination = context.createMediaStreamDestination();
+    gate.onaudioprocess = (event) => {
+      const input = event.inputBuffer.getChannelData(0);
+      const output = event.outputBuffer.getChannelData(0);
+      let sumSquares = 0;
+      for (let index = 0; index < input.length; index++) sumSquares += input[index] * input[index];
+      inputLevel = Math.sqrt(sumSquares / Math.max(1, input.length));
+      // -40 dB RMS opens the gate. A 14ms attack preserves consonants; the
+      // 180ms release prevents choppy endings while clearing room ambience.
+      const targetGain = inputLevel >= 0.01 ? 1 : 0;
+      const smoothing = targetGain > gateGain ? 0.72 : 0.08;
+      gateGain += (targetGain - gateGain) * smoothing;
+      for (let index = 0; index < input.length; index++) output[index] = input[index] * gateGain;
+    };
+    source.connect(highpass);
+    highpass.connect(compressor);
+    compressor.connect(gate);
+    gate.connect(destination);
+    void context.resume();
+    return {
+      stream: destination.stream,
+      level: () => inputLevel,
+      stop() {
+        try { source?.disconnect(); } catch { /* no-op */ }
+        try { highpass?.disconnect(); } catch { /* no-op */ }
+        try { compressor?.disconnect(); } catch { /* no-op */ }
+        try { gate?.disconnect(); } catch { /* no-op */ }
+        destination?.stream?.getTracks().forEach((track) => track.stop());
+        context?.close().catch(() => {});
+      },
+    };
+  } catch {
+    try { source?.disconnect(); } catch { /* no-op */ }
+    context?.close().catch(() => {});
+    return { stream, level: () => 0, stop() {} };
+  }
+}
+
 function createErrorRecord(source, error, extra = {}) {
   const rtcError = error?.error || error;
   return {
@@ -2863,21 +2971,6 @@ function createVoiceControl({ reset = false } = {}) {
 
 function formatVoiceToolName(name) {
   return String(name || 'command').replace(/^control_/, '').replace(/^set_/, '').replaceAll('_', ' ');
-}
-
-/**
- * Voice transcription is shown as an operator record, not an unbounded model
- * stream. Some speech engines occasionally append a token-like tail after a
- * completed sentence; keep the first spoken sentence and reject implausibly
- * long runs so that noise never gets presented as something the operator said.
- */
-function sanitizeVoiceTranscript(value) {
-  const normalized = String(value || '').replace(/\s+/g, ' ').trim();
-  if (!normalized) return '';
-  const firstSentence = normalized.match(/^(.{1,180}?[.!?])(?=\s|$|[a-z])/);
-  const concise = (firstSentence?.[1] || normalized).trim();
-  if (/\S{32,}/.test(concise)) return '';
-  return concise.slice(0, 180);
 }
 
 function formatVoiceToolResult(name, result) {
